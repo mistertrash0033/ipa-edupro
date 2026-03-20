@@ -1,3 +1,9 @@
+# ============================================================
+# STEP 2: The actual build workflow
+# Save as: .github/workflows/build-ios.yml
+# Only run AFTER debug-secrets.yml shows all ✅
+# ============================================================
+
 name: Build iOS IPA
 
 on:
@@ -21,143 +27,90 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # ── 1. Checkout ──────────────────────────────────────────────────────────
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Select Xcode ──────────────────────────────────────────────────────
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      # ── 3. Install CocoaPods ─────────────────────────────────────────────────
-      - name: Install CocoaPods dependencies
+      - name: Install CocoaPods
         run: |
           IOS_DIR="iOS-${{ vars.APP_NAME_SAFE }}"
           if [ -f "$IOS_DIR/Podfile" ]; then
-            cd "$IOS_DIR"
-            pod install --repo-update
-          else
-            echo "No Podfile found, skipping"
+            cd "$IOS_DIR" && pod install --repo-update
           fi
 
-      # ── 4. Import certificate ────────────────────────────────────────────────
-      #
-      #   PREPARE YOUR SECRET — run this on your Mac terminal:
-      #   -------------------------------------------------------
-      #   1. Open Keychain Access
-      #   2. Find your "Apple Distribution" or "iPhone Distribution" certificate
-      #   3. Right-click → Export → save as Certificates.p12 (set a password)
-      #   4. Run: base64 -i Certificates.p12 | pbcopy
-      #      (this copies base64 to clipboard — no flags, standard base64)
-      #   5. Paste into GitHub secret: SIGNING_CERTIFICATE_P12_DATA
-      #   6. Add the export password as: SIGNING_CERTIFICATE_PASSWORD
-      #   -------------------------------------------------------
-      #
       - name: Import certificate
         env:
-          P12_BASE64: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
           P12_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
           KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
-          KEYCHAIN_PASS="temp_$(date +%s)"
+          KEYCHAIN_PASS="kp_$(date +%s)"
           P12_PATH="$RUNNER_TEMP/cert.p12"
 
-          # Decode — Python handles multiline base64 more reliably than base64 CLI
           python3 -c "
           import base64, os, sys
-          data = os.environ['P12_BASE64']
-          # Remove ALL whitespace (spaces, newlines, tabs, carriage returns)
-          data = ''.join(data.split())
-          decoded = base64.b64decode(data)
-          sys.stdout.buffer.write(decoded)
+          data = ''.join(os.environ['P12_DATA'].split())
+          sys.stdout.buffer.write(base64.b64decode(data))
           " > "$P12_PATH"
 
-          echo "P12 size: $(wc -c < "$P12_PATH") bytes"
-          echo "P12 magic bytes: $(xxd -l 4 "$P12_PATH")"
-          # Valid PKCS12 starts with: 30 82 (ASN.1 SEQUENCE)
-          # If you see 00 00 00 00 the secret is empty
-          # If you see 1f 8b 08 00 it's gzip compressed — don't compress before encoding
+          echo "P12 size:  $(wc -c < "$P12_PATH") bytes"
+          echo "P12 magic: $(xxd -l 4 "$P12_PATH")"
 
-          # Verify it's valid PKCS12 before proceeding
-          MAGIC=$(xxd -l 2 -p "$P12_PATH")
-          if [ "$MAGIC" != "3082" ] && [ "$MAGIC" != "3081" ] && [ "$MAGIC" != "3080" ] && [ "$MAGIC" != "308" ]; then
-            echo "⚠️  Warning: unexpected magic bytes '$MAGIC' (expected 30 8x for PKCS12)"
-            echo "This usually means the base64 secret was set incorrectly."
-            echo "Re-encode with: base64 -i Certificates.p12 | pbcopy"
-          fi
-
-          # Create keychain
           security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
 
-          # Import
           security import "$P12_PATH" \
             -k "$KEYCHAIN_PATH" \
             -P "$P12_PASSWORD" \
-            -A \
-            -t cert \
-            -f pkcs12 \
+            -A -t cert -f pkcs12 \
             -T /usr/bin/codesign \
             -T /usr/bin/security \
             -T /usr/bin/productbuild
 
-          # Required on macOS Ventura+ — without this codesign silently fails
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
 
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
 
-          echo "--- Signing identities found ---"
+          echo "--- Signing identities ---"
           security find-identity -v -p codesigning
 
           rm -f "$P12_PATH"
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
           echo "KEYCHAIN_PASS=$KEYCHAIN_PASS" >> $GITHUB_ENV
 
-      # ── 5. Install provisioning profile ──────────────────────────────────────
-      #
-      #   PREPARE YOUR SECRET — run on your Mac:
-      #   base64 -i YourProfile.mobileprovision | pbcopy
-      #   Add as secret: PROVISIONING_PROFILE_DATA
-      #
       - name: Install provisioning profile
         env:
-          PP_BASE64: ${{ secrets.PROVISIONING_PROFILE_DATA }}
+          PP_DATA: ${{ secrets.PROVISIONING_PROFILE_DATA }}
         run: |
           PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
 
           python3 -c "
           import base64, os, sys
-          data = os.environ['PP_BASE64']
-          data = ''.join(data.split())
-          decoded = base64.b64decode(data)
-          sys.stdout.buffer.write(decoded)
+          data = ''.join(os.environ['PP_DATA'].split())
+          sys.stdout.buffer.write(base64.b64decode(data))
           " > "$PP_PATH"
-
-          echo "Profile size: $(wc -c < "$PP_PATH") bytes"
 
           PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" \
             /dev/stdin <<< "$(security cms -D -i "$PP_PATH")")
           echo "Profile UUID: $PROFILE_UUID"
 
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".mobileprovision
+          cp "$PP_PATH" \
+            ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".mobileprovision
 
           echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
 
-      # ── 6. Detect workspace / project ────────────────────────────────────────
       - name: Detect Xcode project
-        id: xcode_target
+        id: xcode
         run: |
           IOS_DIR="iOS-${{ vars.APP_NAME_SAFE }}"
-          echo "Contents of $IOS_DIR:"
-          ls -la "$IOS_DIR"
-
-          # xcworkspace created by CocoaPods takes priority
           WORKSPACE=$(find "$IOS_DIR" -maxdepth 2 -name "*.xcworkspace" \
             ! -path "*.xcodeproj/*" | head -1)
           PROJECT=$(find "$IOS_DIR" -maxdepth 1 -name "*.xcodeproj" | head -1)
@@ -165,33 +118,25 @@ jobs:
           if [ -n "$WORKSPACE" ]; then
             echo "XCODE_FLAG=-workspace" >> $GITHUB_OUTPUT
             echo "XCODE_PATH=$WORKSPACE" >> $GITHUB_OUTPUT
-            echo "Using workspace: $WORKSPACE"
-          elif [ -n "$PROJECT" ]; then
-            echo "XCODE_FLAG=-project" >> $GITHUB_OUTPUT
-            echo "XCODE_PATH=$PROJECT" >> $GITHUB_OUTPUT
-            echo "Using project: $PROJECT"
           else
-            echo "❌ No Xcode project found"
-            exit 1
+            echo "XCODE_FLAG=-project"   >> $GITHUB_OUTPUT
+            echo "XCODE_PATH=$PROJECT"   >> $GITHUB_OUTPUT
           fi
 
-      # ── 7. List schemes ───────────────────────────────────────────────────────
       - name: List schemes
         run: |
           xcodebuild -list \
-            ${{ steps.xcode_target.outputs.XCODE_FLAG }} \
-            "${{ steps.xcode_target.outputs.XCODE_PATH }}" \
-            2>/dev/null || true
+            ${{ steps.xcode.outputs.XCODE_FLAG }} \
+            "${{ steps.xcode.outputs.XCODE_PATH }}" 2>/dev/null || true
 
-      # ── 8. Build archive ──────────────────────────────────────────────────────
       - name: Build archive
         run: |
           SCHEME="${{ vars.APP_SCHEME }}"
           [ -z "$SCHEME" ] && SCHEME="${{ vars.APP_NAME_SAFE }}"
 
           xcodebuild archive \
-            ${{ steps.xcode_target.outputs.XCODE_FLAG }} \
-            "${{ steps.xcode_target.outputs.XCODE_PATH }}" \
+            ${{ steps.xcode.outputs.XCODE_FLAG }} \
+            "${{ steps.xcode.outputs.XCODE_PATH }}" \
             -scheme "$SCHEME" \
             -configuration Release \
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
@@ -204,39 +149,31 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
             | xcpretty
 
-      # ── 9. Export IPA ─────────────────────────────────────────────────────────
       - name: Export IPA
         run: |
           EXPORT_METHOD="${{ github.event.inputs.export_method || 'ad-hoc' }}"
 
-          python3 - << 'PYEOF'
+          python3 - << PYEOF
           import os
-
-          method     = os.environ.get('EXPORT_METHOD', 'ad-hoc')
-          team_id    = "${{ vars.DEVELOPMENT_TEAM }}"
-          bundle_id  = "${{ vars.BUNDLE_ID }}"
-          profile_id = os.environ['PROFILE_UUID']
-          out_path   = os.path.join(os.environ['RUNNER_TEMP'], 'ExportOptions.plist')
-
-          plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+          out = os.path.join(os.environ['RUNNER_TEMP'], 'ExportOptions.plist')
+          with open(out, 'w') as f:
+              f.write(f"""<?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
             "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0"><dict>
-            <key>method</key><string>{method}</string>
-            <key>teamID</key><string>{team_id}</string>
+            <key>method</key><string>{os.environ['EXPORT_METHOD']}</string>
+            <key>teamID</key><string>${{ vars.DEVELOPMENT_TEAM }}</string>
             <key>signingStyle</key><string>manual</string>
             <key>provisioningProfiles</key>
-            <dict><key>{bundle_id}</key><string>{profile_id}</string></dict>
+            <dict>
+              <key>${{ vars.BUNDLE_ID }}</key>
+              <string>{os.environ['PROFILE_UUID']}</string>
+            </dict>
             <key>stripSwiftSymbols</key><true/>
             <key>uploadBitcode</key><false/>
             <key>compileBitcode</key><false/>
             <key>thinning</key><string>&lt;none&gt;</string>
-          </dict></plist>"""
-
-          with open(out_path, 'w') as f:
-              f.write(plist)
-          print(f"ExportOptions written to {out_path}")
-          print(plist)
+          </dict></plist>""")
           PYEOF
 
           xcodebuild -exportArchive \
@@ -245,12 +182,10 @@ jobs:
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             | xcpretty
 
-          echo "--- Output ---"
           ls -lh "$RUNNER_TEMP/ipa"
         env:
           EXPORT_METHOD: ${{ github.event.inputs.export_method || 'ad-hoc' }}
 
-      # ── 10. Upload artifact ───────────────────────────────────────────────────
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
@@ -258,7 +193,6 @@ jobs:
           path: ${{ runner.temp }}/ipa/*.ipa
           retention-days: 30
 
-      # ── 11. Cleanup ───────────────────────────────────────────────────────────
       - name: Cleanup keychain
         if: always()
         run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
