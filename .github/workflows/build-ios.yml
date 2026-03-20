@@ -25,171 +25,219 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Select Xcode version ──────────────────────────────────────────────
+      # ── 2. Select Xcode ──────────────────────────────────────────────────────
       - name: Select Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      # ── 3. Install CocoaPods dependencies (if Podfile exists) ────────────────
-      - name: Install CocoaPods
+      # ── 3. Install CocoaPods ─────────────────────────────────────────────────
+      - name: Install CocoaPods dependencies
         run: |
-          if [ -f "iOS-${{ vars.APP_NAME_SAFE }}/Podfile" ]; then
-            cd "iOS-${{ vars.APP_NAME_SAFE }}"
+          IOS_DIR="iOS-${{ vars.APP_NAME_SAFE }}"
+          if [ -f "$IOS_DIR/Podfile" ]; then
+            cd "$IOS_DIR"
             pod install --repo-update
+          else
+            echo "No Podfile found, skipping pod install"
           fi
 
       # ── 4. Import signing certificate ────────────────────────────────────────
-      #   How to prepare:
-      #   1. Export your .p12 from Keychain Access → base64 encode it:
-      #      base64 -i Certificates.p12 | pbcopy
-      #   2. Add as GitHub secret: SIGNING_CERTIFICATE_P12_DATA
-      #   3. Add certificate password as: SIGNING_CERTIFICATE_PASSWORD
-      - name: Import certificate
+      #
+      #   HOW TO PREPARE YOUR SECRET (run on your Mac):
+      #     base64 -i /path/to/Certificates.p12 -o /dev/stdout | tr -d '\n'
+      #   Paste the single-line output as secret: SIGNING_CERTIFICATE_P12_DATA
+      #
+      - name: Import certificate into keychain
         env:
-          SIGNING_CERTIFICATE_P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
-          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+          P12_DATA: ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          P12_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
         run: |
-          # Create a temporary keychain
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 16)
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASS="$(openssl rand -hex 16)"
 
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Strip all whitespace before decoding — this is the most common failure point
+          echo "$P12_DATA" | tr -d '[:space:]' | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          echo "Cert file size: $(wc -c < "$RUNNER_TEMP/cert.p12") bytes"
+          echo "Cert file type: $(file "$RUNNER_TEMP/cert.p12")"
+
+          # Create a fresh, clean keychain
+          security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
 
-          # Import certificate
-          echo "$SIGNING_CERTIFICATE_P12_DATA" | base64 --decode > /tmp/certificate.p12
-          security import /tmp/certificate.p12 \
+          # Import the certificate
+          security import "$RUNNER_TEMP/cert.p12" \
             -k "$KEYCHAIN_PATH" \
-            -P "$SIGNING_CERTIFICATE_PASSWORD" \
-            -A -t cert -f pkcs12
+            -P "$P12_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security \
+            -T /usr/bin/productbuild
 
-          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          # Allow codesign access without UI prompts (critical on macOS 13+)
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+
+          # Make this keychain searchable
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          echo "--- Available signing identities ---"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
-          # Clean up p12
-          rm /tmp/certificate.p12
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+          echo "KEYCHAIN_PASS=$KEYCHAIN_PASS" >> $GITHUB_ENV
+
+          rm -f "$RUNNER_TEMP/cert.p12"
 
       # ── 5. Install provisioning profile ──────────────────────────────────────
-      #   How to prepare:
-      #   1. Download .mobileprovision from Apple Developer portal
-      #   2. base64 encode it: base64 -i YourApp.mobileprovision | pbcopy
-      #   3. Add as GitHub secret: PROVISIONING_PROFILE_DATA
+      #
+      #   HOW TO PREPARE (run on your Mac):
+      #     base64 -i /path/to/YourApp.mobileprovision -o /dev/stdout | tr -d '\n'
+      #   Paste as secret: PROVISIONING_PROFILE_DATA
+      #
       - name: Install provisioning profile
         env:
-          PROVISIONING_PROFILE_DATA: ${{ secrets.PROVISIONING_PROFILE_DATA }}
+          PP_DATA: ${{ secrets.PROVISIONING_PROFILE_DATA }}
         run: |
-          PP_PATH=$RUNNER_TEMP/build_pp.mobileprovision
-          echo "$PROVISIONING_PROFILE_DATA" | base64 --decode > "$PP_PATH"
+          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
 
-          # Copy to Xcode provisioning profiles directory
+          echo "$PP_DATA" | tr -d '[:space:]' | base64 --decode > "$PP_PATH"
+
+          # Extract UUID
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" \
+            /dev/stdin <<< "$(security cms -D -i "$PP_PATH")")
+
+          echo "Profile UUID: $PROFILE_UUID"
+
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin \
-            <<< $(security cms -D -i "$PP_PATH"))
-          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".mobileprovision
+          cp "$PP_PATH" \
+            ~/Library/MobileDevice/Provisioning\ Profiles/"$PROFILE_UUID".mobileprovision
+
           echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
 
-      # ── 6. Resolve workspace vs project ──────────────────────────────────────
-      - name: Detect workspace or project
-        id: xcode_project
+      # ── 6. Detect workspace or project ───────────────────────────────────────
+      - name: Detect Xcode workspace or project
+        id: xcode_target
         run: |
           IOS_DIR="iOS-${{ vars.APP_NAME_SAFE }}"
-          if ls "$IOS_DIR"/*.xcworkspace 1> /dev/null 2>&1; then
-            WORKSPACE=$(ls "$IOS_DIR"/*.xcworkspace | head -1)
-            echo "build_flag=-workspace $WORKSPACE" >> $GITHUB_OUTPUT
+
+          WORKSPACE=$(find "$IOS_DIR" -maxdepth 1 -name "*.xcworkspace" ! -name "*.xcodeproj" | head -1)
+          PROJECT=$(find  "$IOS_DIR" -maxdepth 1 -name "*.xcodeproj"   | head -1)
+
+          if [ -n "$WORKSPACE" ]; then
+            echo "PROJECT_FLAG=-workspace \"$WORKSPACE\"" >> $GITHUB_OUTPUT
             echo "Using workspace: $WORKSPACE"
-          else
-            PROJECT=$(ls "$IOS_DIR"/*.xcodeproj | head -1)
-            echo "build_flag=-project $PROJECT" >> $GITHUB_OUTPUT
+          elif [ -n "$PROJECT" ]; then
+            echo "PROJECT_FLAG=-project \"$PROJECT\"" >> $GITHUB_OUTPUT
             echo "Using project: $PROJECT"
+          else
+            echo "❌ No Xcode project found in $IOS_DIR"
+            ls -la "$IOS_DIR"
+            exit 1
           fi
 
-      # ── 7. Build archive (.xcarchive) ────────────────────────────────────────
-      - name: Build archive
-        env:
-          BUNDLE_ID: ${{ vars.BUNDLE_ID }}
-          CODE_SIGN_IDENTITY: ${{ vars.CODE_SIGN_IDENTITY }}    # e.g. "iPhone Distribution: Your Name (TEAMID)"
-          DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM }}        # 10-char Apple Team ID
+      # ── 7. List schemes (helps debug scheme name mismatches) ─────────────────
+      - name: List available schemes
         run: |
-          xcodebuild archive \
-            ${{ steps.xcode_project.outputs.build_flag }} \
-            -scheme "${{ vars.APP_NAME_SAFE }}" \
+          IOS_DIR="iOS-${{ vars.APP_NAME_SAFE }}"
+          WORKSPACE=$(find "$IOS_DIR" -maxdepth 1 -name "*.xcworkspace" ! -name "*.xcodeproj" | head -1)
+          PROJECT=$(find  "$IOS_DIR" -maxdepth 1 -name "*.xcodeproj" | head -1)
+          TARGET="${WORKSPACE:-$PROJECT}"
+          FLAG=$([ -n "$WORKSPACE" ] && echo "-workspace \"$TARGET\"" || echo "-project \"$TARGET\"")
+          eval xcodebuild -list $FLAG 2>/dev/null || true
+
+      # ── 8. Build archive ─────────────────────────────────────────────────────
+      - name: Build .xcarchive
+        run: |
+          SCHEME="${{ vars.APP_SCHEME }}"
+          # Fall back to APP_NAME_SAFE if APP_SCHEME var not set
+          if [ -z "$SCHEME" ]; then
+            SCHEME="${{ vars.APP_NAME_SAFE }}"
+          fi
+
+          eval xcodebuild archive \
+            ${{ steps.xcode_target.outputs.PROJECT_FLAG }} \
+            -scheme "\"$SCHEME\"" \
             -configuration Release \
-            -archivePath $RUNNER_TEMP/app.xcarchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
             -destination "generic/platform=iOS" \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            CODE_SIGN_IDENTITY="$CODE_SIGN_IDENTITY" \
-            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" \
+            PRODUCT_BUNDLE_IDENTIFIER="${{ vars.BUNDLE_ID }}" \
+            CODE_SIGN_IDENTITY="${{ vars.CODE_SIGN_IDENTITY }}" \
+            DEVELOPMENT_TEAM="${{ vars.DEVELOPMENT_TEAM }}" \
             PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
             CODE_SIGN_STYLE=Manual \
+            OTHER_CODE_SIGN_FLAGS="--keychain \"$KEYCHAIN_PATH\"" \
             | xcpretty
 
-      # ── 8. Export IPA ─────────────────────────────────────────────────────────
+      # ── 9. Export IPA ────────────────────────────────────────────────────────
       - name: Export IPA
-        env:
-          BUNDLE_ID: ${{ vars.BUNDLE_ID }}
-          DEVELOPMENT_TEAM: ${{ vars.DEVELOPMENT_TEAM }}
         run: |
           EXPORT_METHOD="${{ github.event.inputs.export_method || 'ad-hoc' }}"
+          IPA_DIR="$RUNNER_TEMP/ipa"
 
-          cat > $RUNNER_TEMP/ExportOptions.plist << EOF
-          <?xml version="1.0" encoding="UTF-8"?>
+          # Write ExportOptions.plist using printf to avoid heredoc quoting issues
+          printf '<?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
           <dict>
-            <key>method</key>
-            <string>${EXPORT_METHOD}</string>
-            <key>teamID</key>
-            <string>${DEVELOPMENT_TEAM}</string>
-            <key>bundleID</key>
-            <string>${BUNDLE_ID}</string>
-            <key>signingStyle</key>
-            <string>manual</string>
+            <key>method</key><string>%s</string>
+            <key>teamID</key><string>%s</string>
+            <key>signingStyle</key><string>manual</string>
             <key>provisioningProfiles</key>
             <dict>
-              <key>${BUNDLE_ID}</key>
-              <string>${PROFILE_UUID}</string>
+              <key>%s</key><string>%s</string>
             </dict>
-            <key>stripSwiftSymbols</key>
-            <true/>
-            <key>uploadBitcode</key>
-            <false/>
-            <key>compileBitcode</key>
-            <false/>
+            <key>stripSwiftSymbols</key><true/>
+            <key>uploadBitcode</key><false/>
+            <key>compileBitcode</key><false/>
+            <key>thinning</key><string>&lt;none&gt;</string>
           </dict>
-          </plist>
-          EOF
+          </plist>' \
+            "$EXPORT_METHOD" \
+            "${{ vars.DEVELOPMENT_TEAM }}" \
+            "${{ vars.BUNDLE_ID }}" \
+            "$PROFILE_UUID" \
+            > "$RUNNER_TEMP/ExportOptions.plist"
 
           xcodebuild -exportArchive \
-            -archivePath $RUNNER_TEMP/app.xcarchive \
-            -exportPath $RUNNER_TEMP/ipa \
-            -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportPath "$IPA_DIR" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             | xcpretty
 
-      # ── 9. Upload IPA as artifact ─────────────────────────────────────────────
-      - name: Upload IPA
+          echo "--- Exported files ---"
+          ls -lh "$IPA_DIR"
+
+      # ── 10. Upload IPA artifact ──────────────────────────────────────────────
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ vars.APP_NAME_SAFE }}-IPA
           path: ${{ runner.temp }}/ipa/*.ipa
           retention-days: 30
 
-      # ── 10. (Optional) Upload to TestFlight ──────────────────────────────────
-      #   Uncomment to auto-upload to TestFlight after a successful build.
-      #   Requires: APP_STORE_CONNECT_API_KEY_ID, APP_STORE_CONNECT_ISSUER_ID,
-      #             APP_STORE_CONNECT_API_KEY_CONTENT (base64 .p8 file)
+      # ── 11. Cleanup keychain ─────────────────────────────────────────────────
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+
+      # ── 12. (Optional) Upload to TestFlight ──────────────────────────────────
+      # Set repo variable UPLOAD_TO_TESTFLIGHT=true to enable.
+      # Required secrets: APP_STORE_CONNECT_API_KEY_ID, APP_STORE_CONNECT_ISSUER_ID
+      #                   APP_STORE_CONNECT_API_KEY_CONTENT (base64 .p8)
+      #
       # - name: Upload to TestFlight
-      #   env:
-      #     API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
-      #     ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-      #     API_KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_API_KEY_CONTENT }}
+      #   if: vars.UPLOAD_TO_TESTFLIGHT == 'true'
       #   run: |
       #     mkdir -p ~/.appstoreconnect/private_keys
-      #     echo "$API_KEY_CONTENT" | base64 --decode > \
-      #       ~/.appstoreconnect/private_keys/AuthKey_${API_KEY_ID}.p8
-      #     xcrun altool --upload-app \
-      #       --type ios \
-      #       --file $(ls $RUNNER_TEMP/ipa/*.ipa) \
-      #       --apiKey "$API_KEY_ID" \
-      #       --apiIssuer "$ISSUER_ID"
+      #     echo "${{ secrets.APP_STORE_CONNECT_API_KEY_CONTENT }}" | base64 --decode \
+      #       > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
+      #     xcrun altool --upload-app --type ios \
+      #       --file "$(ls $RUNNER_TEMP/ipa/*.ipa)" \
+      #       --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}" \
+      #       --apiIssuer "${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}"
