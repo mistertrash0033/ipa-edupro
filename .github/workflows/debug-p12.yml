@@ -1,0 +1,26 @@
+name: Debug P12 Secret
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check secret length
+        run: |
+          echo "P12 length:  ${#P12}"
+          echo "PASS length: ${#PASS}"
+          echo "PP length:   ${#PP}"
+
+          if [ "${#P12}" -eq 0 ]; then
+            echo ""
+            echo "❌ SIGNING_CERTIFICATE_P12_DATA is EMPTY"
+            echo "   The secret was never saved, or was saved blank."
+          else
+            echo "✅ P12 secret has ${#P12} characters"
+          fi
+        env:
+          P12:  ${{ secrets.SIGNING_CERTIFICATE_P12_DATA }}
+          PASS: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+          PP:   ${{ secrets.PROVISIONING_PROFILE_DATA }}
