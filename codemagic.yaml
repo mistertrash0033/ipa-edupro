@@ -1,1 +1,30 @@
+workflows:
+  ios-build:
+    name: iOS Build
+    max_build_duration: 60
 
+    environment:
+      xcode: latest
+      vars:
+        BUNDLE_ID: "com.softprosolutions.edupro"
+
+    scripts:
+      - name: Install CocoaPods
+        script: |
+          pod install
+
+      - name: Build IPA
+        script: |
+          xcodebuild \
+          -workspace ios-edupro.xcworkspace \
+          -scheme ios-edupro \
+          -configuration Release \
+          -archivePath build/ios/Runner.xcarchive archive
+
+          xcodebuild -exportArchive \
+          -archivePath build/ios/Runner.xcarchive \
+          -exportOptionsPlist ExportOptions.plist \
+          -exportPath build/ios/ipa
+
+    artifacts:
+      - build/ios/ipa/*.ipa
